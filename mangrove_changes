@@ -1,0 +1,659 @@
+// ======================================================================
+// PROTOTIPO DE ALERTA POR VOTOS PARA DEGRADACIÓN / DEFORESTACIÓN DE MANGLE
+// Sentinel-2 SR Harmonized - Google Earth Engine Code Editor
+// ======================================================================
+//
+// Lógica general:
+//
+// 1. El usuario define fechas T0 y T1.
+// 2. Se filtra Sentinel-2 por AOI, fechas y nubosidad.
+// 3. Se construyen mosaicos por mediana.
+// 4. Se calculan 5 índices no redundantes:
+//    - MRI
+//    - NDVI
+//    - NDMI
+//    - NBR
+//    - NDRE
+// 5. Cada índice se normaliza de 0 a 100 usando percentiles de T0.
+// 6. Se calcula pérdida porcentual:
+//
+//        perdida_% = indice_T0_norm - indice_T1_norm
+//
+// 7. Si perdida_% >= umbral, ese índice vota alerta = 1.
+// 8. Si al menos 3 de 5 índices votan alerta, el pixel recibe RED FLAG.
+//
+// ======================================================================
+
+
+// ======================================================================
+// 0. PARÁMETROS EDITABLES POR EL USUARIO
+// ======================================================================
+
+// Fechas T0
+var startDateT0 = '2019-01-01';
+var endDateT0   = '2019-02-28';
+
+// Fechas T1
+var startDateT1 = '2026-01-01';
+var endDateT1   = '2026-02-28';
+
+// Nubosidad máxima permitida por imagen Sentinel-2
+var maxCloudCover = 20;
+
+// Umbral de pérdida espectral porcentual.
+// Ejemplo: 40 significa pérdida >= 40 puntos porcentuales
+// en el índice normalizado 0-100.
+var alertThresholdPct = 25;
+
+// Número mínimo de votos para declarar RED FLAG.
+// Ejemplo: 3 significa que al menos 3 de 5 índices deben detectar alerta.
+var minVotes = 3;
+
+// Percentiles usados para normalizar cada índice con base en T0.
+// Esto evita depender de rangos fijos y ayuda a adaptar el análisis al AOI.
+var percentileLow  = 5;
+var percentileHigh = 95;
+
+// Escala de trabajo.
+// Sentinel-2 tiene 10 m en visible/NIR, pero SWIR y red-edge son 20 m.
+// Como usamos SWIR y red-edge, 20 m es más consistente.
+var analysisScale = 20;
+
+// Carpeta de exportación en Google Drive
+var exportFolder = 'MANGLE_ALERTAS_PROTOTIPO';
+
+// Activar o desactivar exportaciones.
+// Si solo quieres probar visualmente, deja false.
+// Si quieres crear tareas de exportación, cambia a true.
+var doExport = false;
+
+
+// ======================================================================
+// 1. ÁREA DE INTERÉS
+// ======================================================================
+
+// Usa un AOI importado en el Code Editor con nombre "aoi".
+var aoiGeom = aoi;
+
+// Si dibujaste una geometría llamada "geometry", usa esto en lugar de lo anterior:
+// var aoiGeom = geometry;
+
+// Si tu AOI es una FeatureCollection y aparece algún error,
+// puedes probar:
+// var aoiGeom = aoi.geometry();
+
+Map.centerObject(aoiGeom, 11);
+
+
+// ======================================================================
+// 2. BANDAS SENTINEL-2
+// ======================================================================
+//
+// B2  = Blue
+// B3  = Green
+// B4  = Red
+// B5  = Red Edge 1
+// B8  = NIR
+// B8A = Narrow NIR / Red Edge 4
+// B11 = SWIR1
+// B12 = SWIR2
+
+var s2Bands = [
+  'B2',
+  'B3',
+  'B4',
+  'B5',
+  'B8',
+  'B8A',
+  'B11',
+  'B12'
+];
+
+var indexBands = [
+  'MRI',
+  'NDVI',
+  'NDMI',
+  'NBR',
+  'NDRE'
+];
+
+var allOutputBands = s2Bands.concat([
+  'WI',
+  'GVI',
+  'MRI',
+  'NDVI',
+  'NDMI',
+  'NBR',
+  'NDRE'
+]);
+
+
+// ======================================================================
+// 3. MÁSCARA DE NUBES SENTINEL-2 USANDO SCL
+// ======================================================================
+
+function maskS2sr(image) {
+  var scl = image.select('SCL');
+
+  // Clases SCL excluidas:
+  // 0  = No data
+  // 1  = Saturated / defective
+  // 3  = Cloud shadow
+  // 8  = Cloud medium probability
+  // 9  = Cloud high probability
+  // 10 = Thin cirrus
+  // 11 = Snow / ice
+  var mask = scl.neq(0)
+    .and(scl.neq(1))
+    .and(scl.neq(3))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  // Sentinel-2 SR está escalado por 10000.
+  // Convertimos a reflectancia 0-1.
+  var scaled = image.select(s2Bands)
+    .multiply(0.0001)
+    .updateMask(mask);
+
+  return scaled.copyProperties(image, ['system:time_start']);
+}
+
+
+// ======================================================================
+// 4. FUNCIÓN PARA AGREGAR LOS 5 ÍNDICES
+// ======================================================================
+
+function addIndices(image) {
+  var blue  = image.select('B2');
+  var green = image.select('B3');
+  var red   = image.select('B4');
+  var re1   = image.select('B5');
+  var nir   = image.select('B8');
+  var nirN  = image.select('B8A');
+  var swir1 = image.select('B11');
+  var swir2 = image.select('B12');
+
+  // --------------------------------------------------------------------
+  // WI: se conserva la lógica del índice ponderado usado en tu script.
+  // Adaptación de bandas Landsat a Sentinel-2:
+  // Blue  -> B2
+  // Green -> B3
+  // Red   -> B4
+  // NIR   -> B8
+  // SWIR1 -> B11
+  // SWIR2 -> B12
+  // --------------------------------------------------------------------
+  var WI = blue.multiply(0.0315)
+    .add(green.multiply(0.2021))
+    .add(red.multiply(0.3102))
+    .add(nir.multiply(0.1594))
+    .add(swir1.multiply(-0.6806))
+    .add(swir2.multiply(-0.6109))
+    .rename('WI');
+
+  // GVI
+  var GVI = green.subtract(red)
+    .divide(green.add(red))
+    .rename('GVI');
+
+  // MRI
+  var MRI = GVI.multiply(WI.multiply(2))
+    .rename('MRI');
+
+  // NDVI: vigor fotosintético / verdor
+  var NDVI = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  // NDMI: humedad de vegetación
+  var NDMI = nir.subtract(swir1)
+    .divide(nir.add(swir1))
+    .rename('NDMI');
+
+  // NBR: disturbio / pérdida de biomasa / estrés severo
+  var NBR = nir.subtract(swir2)
+    .divide(nir.add(swir2))
+    .rename('NBR');
+
+  // NDRE: clorofila / estrés usando red-edge
+  var NDRE = nirN.subtract(re1)
+    .divide(nirN.add(re1))
+    .rename('NDRE');
+
+  return image.addBands([
+    WI,
+    GVI,
+    MRI,
+    NDVI,
+    NDMI,
+    NBR,
+    NDRE
+  ]);
+}
+
+
+// ======================================================================
+// 5. COLECCIÓN SENTINEL-2
+// ======================================================================
+
+function getS2Collection(startDate, endDate) {
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoiGeom)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', maxCloudCover))
+    .map(maskS2sr)
+    .map(addIndices);
+}
+
+
+// ======================================================================
+// 6. MOSAICOS DE MEDIANA T0 Y T1
+// ======================================================================
+
+function prepareMedianComposite(collection, startDate) {
+  var blank = ee.Image.constant(ee.List.repeat(0, allOutputBands.length))
+    .rename(allOutputBands)
+    .clip(aoiGeom);
+
+  var composite = ee.Image(
+    ee.Algorithms.If(
+      collection.size().gt(0),
+      collection.select(allOutputBands).median(),
+      blank
+    )
+  );
+
+  return composite
+    .set('system:time_start', ee.Date(startDate).millis())
+    .clip(aoiGeom);
+}
+
+var colT0 = getS2Collection(startDateT0, endDateT0);
+var colT1 = getS2Collection(startDateT1, endDateT1);
+
+print('Escenas Sentinel-2 T0:', colT0.size());
+print('Escenas Sentinel-2 T1:', colT1.size());
+
+var imgT0 = prepareMedianComposite(colT0, startDateT0);
+var imgT1 = prepareMedianComposite(colT1, startDateT1);
+
+
+// ======================================================================
+// 7. NORMALIZACIÓN 0-100 USANDO PERCENTILES DE T0
+// ======================================================================
+//
+// La normalización se hace por índice:
+//
+// indice_norm = ((indice - P5_T0) / (P95_T0 - P5_T0)) * 100
+//
+// Luego se limita entre 0 y 100.
+//
+// Esto permite que el umbral de alerta sea interpretable como porcentaje
+// relativo al rango espectral observado en T0 dentro del AOI.
+
+function getBaselineRange(image, bandName) {
+  var stats = image.select(bandName).reduceRegion({
+    reducer: ee.Reducer.percentile([percentileLow, percentileHigh]),
+    geometry: aoiGeom,
+    scale: analysisScale,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+  var pLow = ee.Number(stats.get(bandName + '_p' + percentileLow));
+  var pHigh = ee.Number(stats.get(bandName + '_p' + percentileHigh));
+
+  return {
+    min: pLow,
+    max: pHigh
+  };
+}
+
+function normalizeToPercent(image, bandName, rangeObj) {
+  var minVal = ee.Number(rangeObj.min);
+  var maxVal = ee.Number(rangeObj.max);
+  var denom = maxVal.subtract(minVal).max(1e-6);
+
+  return image.select(bandName)
+    .subtract(minVal)
+    .divide(denom)
+    .multiply(100)
+    .clamp(0, 100)
+    .rename(bandName + '_norm');
+}
+
+
+// ======================================================================
+// 8. ALERTA POR CADA ÍNDICE
+// ======================================================================
+
+function makeIndexAlert(imgT0, imgT1, bandName) {
+  var rangeObj = getBaselineRange(imgT0, bandName);
+
+  print('Rango de normalización T0 para ' + bandName, {
+    pLow: rangeObj.min,
+    pHigh: rangeObj.max
+  });
+
+  var normT0 = normalizeToPercent(imgT0, bandName, rangeObj)
+    .rename(bandName + '_T0_norm');
+
+  var normT1 = normalizeToPercent(imgT1, bandName, rangeObj)
+    .rename(bandName + '_T1_norm');
+
+  var lossPct = normT0
+    .subtract(normT1)
+    .rename('LOSS_' + bandName);
+
+  var alert = lossPct
+    .gte(alertThresholdPct)
+    .rename('ALERT_' + bandName)
+    .toByte();
+
+  return {
+    normT0: normT0,
+    normT1: normT1,
+    loss: lossPct,
+    alert: alert
+  };
+}
+
+
+// ======================================================================
+// 9. GENERAR ALERTAS, PÉRDIDAS Y VOTOS
+// ======================================================================
+
+var alertImages = [];
+var lossImages = [];
+var normT0Images = [];
+var normT1Images = [];
+
+indexBands.forEach(function(bandName) {
+  var result = makeIndexAlert(imgT0, imgT1, bandName);
+
+  alertImages.push(result.alert);
+  lossImages.push(result.loss);
+  normT0Images.push(result.normT0);
+  normT1Images.push(result.normT1);
+});
+
+var alertStack = ee.Image.cat(alertImages);
+var lossStack  = ee.Image.cat(lossImages);
+var normT0Stack = ee.Image.cat(normT0Images);
+var normT1Stack = ee.Image.cat(normT1Images);
+
+// Suma de votos 0-5
+var voteSum = alertStack
+  .reduce(ee.Reducer.sum())
+  .rename('VOTOS_ALERTA')
+  .toByte()
+  .clip(aoiGeom);
+
+// Red flag final
+var redFlag = voteSum
+  .gte(minVotes)
+  .rename('RED_FLAG')
+  .toByte()
+  .clip(aoiGeom);
+
+
+// ======================================================================
+// 10. ESTADÍSTICAS DE ÁREA
+// ======================================================================
+
+var pixelAreaHa = ee.Image.pixelArea().divide(10000).rename('area_ha');
+
+// Área total red flag
+var redFlagAreaHa = pixelAreaHa
+  .updateMask(redFlag.eq(1))
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: aoiGeom,
+    scale: analysisScale,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+print('Área RED FLAG estimada [ha]:', redFlagAreaHa);
+
+// Área por número de votos
+var areaByVotes = pixelAreaHa
+  .addBands(voteSum.rename('votes'))
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'votes'
+    }),
+    geometry: aoiGeom,
+    scale: analysisScale,
+    maxPixels: 1e13,
+    bestEffort: true,
+    tileScale: 4
+  });
+
+print('Área por número de votos [ha]:', areaByVotes);
+
+
+// ======================================================================
+// 11. VISUALIZACIÓN
+// ======================================================================
+
+// RGB Sentinel-2
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0.02,
+  max: 0.30,
+  gamma: 1.2
+};
+
+// Paletas color blind safe
+var indexVis = {
+  min: 0,
+  max: 100,
+  palette: [
+    '#F7F7F7',
+    '#D9D9D9',
+    '#92C5DE',
+    '#0571B0',
+    '#023858'
+  ]
+};
+
+var lossVis = {
+  min: 0,
+  max: 100,
+  palette: [
+    '#F7F7F7',
+    '#F0E442',
+    '#E69F00',
+    '#D55E00',
+    '#7F3B08'
+  ]
+};
+
+var votesVis = {
+  min: 0,
+  max: 5,
+  palette: [
+    '#F7F7F7',
+    '#D9D9D9',
+    '#BDBDBD',
+    '#F0E442',
+    '#E69F00',
+    '#D55E00'
+  ]
+};
+
+var alertVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    '#00000000',
+    '#D55E00'
+  ]
+};
+
+Map.addLayer(imgT0, rgbVis, 'T0_RGB_mediana');
+Map.addLayer(imgT1, rgbVis, 'T1_RGB_mediana');
+
+// Índices originales
+indexBands.forEach(function(bandName) {
+  Map.addLayer(
+    imgT0.select(bandName),
+    {min: -1, max: 1, palette: ['#7F3B08', '#F7F7F7', '#0571B0']},
+    'T0_' + bandName,
+    false
+  );
+
+  Map.addLayer(
+    imgT1.select(bandName),
+    {min: -1, max: 1, palette: ['#7F3B08', '#F7F7F7', '#0571B0']},
+    'T1_' + bandName,
+    false
+  );
+});
+
+// Índices normalizados
+indexBands.forEach(function(bandName) {
+  Map.addLayer(
+    normT0Stack.select(bandName + '_T0_norm'),
+    indexVis,
+    'T0_' + bandName + '_norm_0_100',
+    false
+  );
+
+  Map.addLayer(
+    normT1Stack.select(bandName + '_T1_norm'),
+    indexVis,
+    'T1_' + bandName + '_norm_0_100',
+    false
+  );
+});
+
+// Pérdida por índice
+indexBands.forEach(function(bandName) {
+  Map.addLayer(
+    lossStack.select('LOSS_' + bandName),
+    lossVis,
+    'LOSS_' + bandName + '_pct',
+    false
+  );
+});
+
+// Alertas por índice
+indexBands.forEach(function(bandName) {
+  Map.addLayer(
+    alertStack.select('ALERT_' + bandName).selfMask(),
+    alertVis,
+    'ALERT_' + bandName,
+    false
+  );
+});
+
+// Votos y red flag final
+Map.addLayer(voteSum, votesVis, 'VOTOS_ALERTA_0_a_5', true);
+
+Map.addLayer(
+  redFlag.selfMask(),
+  {palette: ['#D55E00']},
+  'RED_FLAG_CONSENSO_' + minVotes + '_de_5',
+  true
+);
+
+
+// ======================================================================
+// 12. EXPORTACIONES OPCIONALES
+// ======================================================================
+
+function exportImage(image, name) {
+  Export.image.toDrive({
+    image: image,
+    description: name,
+    folder: exportFolder,
+    fileNamePrefix: name,
+    region: aoiGeom,
+    scale: analysisScale,
+    maxPixels: 1e13
+  });
+}
+
+if (doExport) {
+
+  // Mosaicos RGB
+  exportImage(
+    imgT0.select(['B4', 'B3', 'B2']).toFloat(),
+    'T0_RGB_mediana_S2'
+  );
+
+  exportImage(
+    imgT1.select(['B4', 'B3', 'B2']).toFloat(),
+    'T1_RGB_mediana_S2'
+  );
+
+  // Índices originales
+  indexBands.forEach(function(bandName) {
+    exportImage(
+      imgT0.select(bandName).toFloat(),
+      'T0_' + bandName
+    );
+
+    exportImage(
+      imgT1.select(bandName).toFloat(),
+      'T1_' + bandName
+    );
+  });
+
+  // Índices normalizados
+  exportImage(
+    normT0Stack.toFloat(),
+    'T0_indices_normalizados_0_100'
+  );
+
+  exportImage(
+    normT1Stack.toFloat(),
+    'T1_indices_normalizados_0_100'
+  );
+
+  // Pérdidas porcentuales por índice
+  exportImage(
+    lossStack.toFloat(),
+    'LOSS_indices_pct'
+  );
+
+  // Alertas binarias por índice
+  exportImage(
+    alertStack.toByte(),
+    'ALERTAS_binarias_por_indice'
+  );
+
+  // Votos
+  exportImage(
+    voteSum.toByte(),
+    'VOTOS_ALERTA_0_a_5'
+  );
+
+  // Red flag final
+  exportImage(
+    redFlag.toByte(),
+    'RED_FLAG_CONSENSO_' + minVotes + '_de_5'
+  );
+}
+
+
+// ======================================================================
+// 13. MENSAJES DE CONTROL
+// ======================================================================
+
+print('Índices usados:', indexBands);
+print('Umbral de alerta por índice [%]:', alertThresholdPct);
+print('Número mínimo de votos para RED FLAG:', minVotes);
+print('Mosaico T0:', imgT0);
+print('Mosaico T1:', imgT1);
+print('Stack de pérdidas:', lossStack);
+print('Stack de alertas:', alertStack);
+print('Votos:', voteSum);
+print('Red flag:', redFlag);
